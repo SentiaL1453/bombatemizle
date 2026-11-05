@@ -40,32 +40,32 @@ local GUI_CLASSES = {"Frame", "TextLabel", "TextButton", "TextBox", "ImageLabel"
 local TEXT_CLASSES = {"TextLabel", "TextButton", "TextBox"}
 
 ---- offsets ----
-local function fetch_json(urls: {string})
-    local last_err = "unknown"
-    for i = 1, #urls do
-        local ok, body = pcall(function()
-            return game:HttpGet(urls[i])
-        end)
-        if not ok or not body or #body == 0 then
-            last_err = "httpget_failed"
-        else
-            local ok_decode, data = pcall(function()
-                return crypt.json.decode(body)
-            end)
-            if ok_decode and data then
-                return data, nil
+local OFFSETS_URL = "https://offsets.imtheo.lol/version-5a21b87bbc2641cf/offsets.txt"
+local function parseOffsetText(body: string): ({Offsets: {[string]: {[string]: number}}}, number)
+    local parsed = {Offsets = {}}
+    local count = 0
+    for line in string.gmatch(body, "[^\r\n]+") do
+        local class, field, digits = string.match(line,
+            "^%s*([%w_]+)::([%w_]+)%s*=%s*0[xX]([%da-fA-F]+)%s*$")
+        if class then
+            local value = tonumber(digits, 16)
+            if value then
+                if not parsed.Offsets[class] then parsed.Offsets[class] = {} end
+                parsed.Offsets[class][field] = value
+                count = count + 1
             end
-            last_err = "decode_failed"
         end
     end
-    return nil, last_err
+    return parsed, count
 end
-
--- GitHub'dan offsets al (Jonah kaldırıldı)
-local Offsets, OffsetsErr = fetch_json({
-    "https://raw.githubusercontent.com/Sploiter13/imth/refs/heads/main/Offsets.json",
-})
-assert(Offsets, "Failed to fetch offsets from GitHub (" .. tostring(OffsetsErr) .. ")")
+local fetchOK, offsetBody = pcall(function() return game:HttpGet(OFFSETS_URL) end)
+assert(fetchOK and type(offsetBody) == "string" and #offsetBody > 0,
+    "Failed to download version-5a21b87bbc2641cf offsets: " .. tostring(offsetBody))
+local Offsets, offsetCount = parseOffsetText(offsetBody)
+assert(offsetCount > 0 and Offsets.Offsets.GuiObject and Offsets.Offsets.GuiObject.Text,
+    "Offset file is missing GuiObject::Text")
+print(string.format("[Offsets] version-5a21b87bbc2641cf fields=%d GuiObject.Text=0x%X",
+    offsetCount, Offsets.Offsets.GuiObject.Text))
 
 task.wait(1)
 local function hex(dec)
@@ -82,6 +82,10 @@ end
 local function getOffset(class, field)
     local offsetsData = Offsets.offsets or Offsets.Offsets or Offsets.data or Offsets.Data
     local v = offsetsData and offsetsData[class] and offsetsData[class][field]
+    if v == nil and field == "Text"
+        and (class == "TextLabel" or class == "TextButton" or class == "TextBox") then
+        v = offsetsData and offsetsData.GuiObject and offsetsData.GuiObject.Text
+    end
     return hex(v)
 end
 
@@ -1348,7 +1352,11 @@ Instance.declare({
                 error("Unknown text class: " .. tostring(self.ClassName))
             end
             
-            return memory_readstring(self, offset)
+            local selected = tonumber(_G.MS_TEXT_OFFSET)
+            if selected and _G.MS_TEXT_MODE == "address" then
+                return memory_readstring(self.Data + selected)
+            end
+            return memory_readstring(self, selected or offset)
         end,
         set = function(self, value)
             local offset
@@ -4980,8 +4988,11 @@ do
         _G.MS_TEXT_OFFSET = tonumber(rawTextOffset)
             or tonumber(string.gsub(rawTextOffset, "^0[xX]", ""), 16)
     end
-    -- Discovered on the active Severe/Roblox build using memory.readstring.
-    _G.MS_TEXT_OFFSET = 0xB98
+    _G.MS_TEXT_FETCHED_OFFSET = _G.MS_TEXT_OFFSET
+    -- Verified below against multiple live labels before using text as a clue.
+    _G.MS_TEXT_OFFSET = nil
+    _G.MS_TEXT_MODE = nil
+    _G.MS_TEXT_VALIDATED = false
 end
 task.wait(1)
 end
@@ -5051,8 +5062,8 @@ local PathFScore: {[string]: number} = {}
 local PathClosedSet: {[string]: boolean} = {}
 
 local MAX_TILES: number = 1000
-local MAX_RENDER_TILES: number = 200
-local MAX_FRONTIER_TILES: number = 300
+local MAX_RENDER_TILES: number = MAX_TILES
+local MAX_FRONTIER_TILES: number = MAX_TILES
 local MAX_PENDING_VERIFICATIONS: number = 30
 local MAX_PATH_ITERATIONS: number = 400
 local MAX_PATH_LENGTH: number = 100
@@ -5247,6 +5258,20 @@ local LockedTarget: CandidateData? = nil
 local TickCount: number = 0
 local LastChildCount: number = 0
 local SolverChanged: boolean = false
+local SolverStatus: string = "Starting"
+local LastReportedError: {[string]: number} = {}
+local function SafeCall(stage: string, callback: () -> ()): boolean
+    local ok, err = Pcall(callback)
+    if not ok then
+        SolverStatus = stage .. ": " .. tostring(err)
+        local now = OsClock()
+        if not LastReportedError[stage] or now - LastReportedError[stage] >= 5 then
+            LastReportedError[stage] = now
+            print("[Minesweeper] " .. SolverStatus)
+        end
+    end
+    return ok
+end
 local WasAutoFlagKeyPressed: boolean = false
 local WasAutoWalkKeyPressed: boolean = false
 
@@ -5770,77 +5795,141 @@ local function WorldToGridCoords(pos: Vector3): (number, number)
     return gx, gz
 end
 
-local function DetermineTileType(part: BasePart?): (string, number?)
-    if not CheckParentValid(part) then
-        return "deleted", nil
+-- Only these previously supplied fields are tested; no broad address scanning.
+local function FindNumberLabel(part: BasePart?): Instance?
+    local gui = SafeFindFirstChild(part, "NumberGui")
+    if not gui then return nil end
+    local direct = SafeFindFirstChild(gui, "TextLabel")
+    if direct then return direct end
+    local ok, found = Pcall(function() return gui:FindFirstDescendant("TextLabel") end)
+    if ok then return found end
+    return nil
+end
+
+local function ProbeTextOffset(): ()
+    local labels: {Instance} = {}
+    for i = 1, TileCount do
+        local label = FindNumberLabel(Tiles[i].part)
+        if label then labels[#labels + 1] = label end
+        if #labels >= 128 then break end
     end
-    
-    local numberGui: Instance? = SafeFindFirstChild(part, "NumberGui")
-    if numberGui then
-        local label: Instance? = SafeFindFirstChild(numberGui, "TextLabel")
-        if label then
-            local success: boolean, text: string? = SafeGetProperty(label, "Text")
-
-            -- Some external Instance bridges fail to expose TextLabel.Text even
-            -- though the object and its memory are valid. Read the same field
-            -- directly using Merge2's current offset as a fallback.
-            if not success or type(text) ~= "string" then
-                success, text = Pcall(function()
-                    return memory.readstring(label, _G.MS_TEXT_OFFSET or 0xB88)
+    print("[TextProbe] labels=" .. #labels .. " fetched=" .. tostring(_G.MS_TEXT_FETCHED_OFFSET))
+    if #labels == 0 then
+        print("[TextProbe] No NumberGui/TextLabel samples yet; reveal clues and wait.")
+        return
+    end
+    local offsets, seen = {}, {}
+    local function addOffset(value: any): ()
+        local n = tonumber(value)
+        if n and n > 0 and n % 1 == 0 and not seen[n] then
+            seen[n] = true
+            offsets[#offsets + 1] = n
+        end
+    end
+    addOffset(_G.MS_TEXT_OFFSET_OVERRIDE)
+    addOffset(_G.MS_TEXT_FETCHED_OFFSET)
+    addOffset(0xB98)
+    addOffset(0xB88)
+    addOffset(0xDF8)
+    local matches = {}
+    for _, offset in offsets do
+        for _, mode in {"source", "address"} do
+            local digits, blanks, invalid, errors, positive = 0, 0, 0, 0, 0
+            local samples = {}
+            for _, label in labels do
+                local ok, text = Pcall(function()
+                    if mode == "address" then return memory.readstring(label.Data + offset) end
+                    return memory.readstring(label, offset)
                 end)
-            end
-
-            -- Severe also documents the absolute-address overload. Different
-            -- Roblox builds have used both the class-specific and shared GUI
-            -- text offsets, so test known candidates and accept digits only.
-            if not success or type(text) ~= "string" or tonumber(text) == nil then
-                local candidateOffsets = {
-                    _G.MS_TEXT_OFFSET or 0xB98,
-                    0xB98, -- discovered TextLabel value for this build
-                    0xB88, -- TextLabel.Text in the current Jonah layout
-                    0xDF8  -- GuiObject.Text in the alternate Theo layout
-                }
-
-                for i = 1, #candidateOffsets do
-                    local offset = candidateOffsets[i]
-
-                    local okSource, sourceText = Pcall(function()
-                        return memory.readstring(label, offset)
-                    end)
-                    if okSource and type(sourceText) == "string"
-                        and tonumber(sourceText) ~= nil then
-                        success, text = true, sourceText
-                        break
-                    end
-
-                    local okAddress, addressText = Pcall(function()
-                        return memory.readstring(label.Data + offset)
-                    end)
-                    if okAddress and type(addressText) == "string"
-                        and tonumber(addressText) ~= nil then
-                        success, text = true, addressText
-                        break
+                if not ok then errors += 1
+                elseif type(text) ~= "string" then invalid += 1
+                else
+                    local clean = string.match(text, "^%s*(.-)%s*$")
+                    if clean == "" then blanks += 1
+                    elseif string.match(clean, "^[0-8]$") then
+                        digits += 1
+                        if tonumber(clean) > 0 then positive += 1 end
+                    else invalid += 1 end
+                    if #samples < 4 and clean ~= "" then
+                        samples[#samples + 1] = string.format("%q", string.sub(text, 1, 40))
                     end
                 end
             end
-
-            if success and text and type(text) == "string" then
-                if text == SAFE_TEXT or text == "" or text == " " then
-                    return "empty", 0
-                end
-                local n: number? = tonumber(text)
-                if n then
-                    return "number", n
-                end
+            print(string.format("[TextProbe] 0x%X %s digits=%d positive=%d blanks=%d invalid=%d errors=%d samples=%s",
+                offset, mode, digits, positive, blanks, invalid, errors, table.concat(samples, ",")))
+            -- Blank strings alone cannot establish that a field contains clue text.
+            if positive >= 2 and invalid == 0 and errors == 0 then
+                matches[#matches + 1] = {offset = offset, mode = mode}
             end
         end
     end
-    
-    local success: boolean, col: Color3? = SafeGetProperty(part, "Color")
-    if success and col == MINE_COLOR then
-        return "mine", nil
+    local chosen = nil
+    local ambiguous = false
+    local override = tonumber(_G.MS_TEXT_OFFSET_OVERRIDE)
+    for _, candidate in matches do
+        if not override or candidate.offset == override then
+            if not chosen then chosen = candidate
+            elseif chosen.offset ~= candidate.offset then ambiguous = true end
+        end
     end
-    
+    if chosen and not ambiguous then
+        _G.MS_TEXT_OFFSET = chosen.offset
+        _G.MS_TEXT_MODE = chosen.mode
+        _G.MS_TEXT_VALIDATED = true
+        print(string.format("[TextProbe] SELECTED 0x%X %s (%d live labels); compare samples with visible clues.",
+            chosen.offset, chosen.mode, #labels))
+    else
+        _G.MS_TEXT_OFFSET = nil
+        _G.MS_TEXT_VALIDATED = false
+        print("[TextProbe] No unique validated offset. Send all [TextProbe] lines; no clues will be guessed.")
+    end
+end
+
+local function DetermineTileType(part: BasePart?): (string, number?)
+    if not CheckParentValid(part) then return "deleted", nil end
+    local numberGui = SafeFindFirstChild(part, "NumberGui")
+    if numberGui then
+        if not _G.MS_TEXT_VALIDATED then return "unreadable", nil end
+        local label = SafeFindFirstChild(numberGui, "TextLabel")
+        if not label then
+            local ok, found = Pcall(function()
+                return numberGui:FindFirstDescendant("TextLabel")
+            end)
+            if ok then label = found end
+        end
+        if label then
+            local function parse(text: any): (string?, number?)
+                if type(text) ~= "string" then return nil, nil end
+                local clean = string.match(text, "^%s*(.-)%s*$")
+                if clean == "" then return "empty", 0 end
+                if string.match(clean, "^[0-8]$") then
+                    local n = tonumber(clean)
+                    return n == 0 and "empty" or "number", n
+                end
+                return nil, nil
+            end
+            local ok, text = SafeGetProperty(label, "Text")
+            if ok then
+                local kind, n = parse(text)
+                if kind then return kind, n end
+            end
+            local offset = tonumber(_G.MS_TEXT_OFFSET)
+            if offset then
+                local readOK, raw = Pcall(function()
+                    if _G.MS_TEXT_MODE == "address" then return memory.readstring(label.Data + offset) end
+                    return memory.readstring(label, offset)
+                end)
+                if readOK then
+                    local kind, n = parse(raw)
+                    if kind then return kind, n end
+                end
+            end
+        end
+        -- A present GUI with unreadable text is not a covered variable or a zero.
+        return "unreadable", nil
+    end
+    local ok, col = SafeGetProperty(part, "Color")
+    if ok and col == MINE_COLOR then return "mine", nil end
     return "unknown", nil
 end
 
@@ -6738,29 +6827,24 @@ local function ReduceEquations(localEqs: {Equation}): ({Equation}?, string)
 end
 
 local function AnalyzeNeighbors(t: TileData): (number, {TileData})
-    local adj: {TileData} = FetchNeighbors(t)
-    local knownMines: number = 0
-    local unknowns: {TileData} = TableCreate(8)
-    local unknownCount: number = 0
-    
+    local adj = FetchNeighbors(t)
+    local knownMines = 0
+    local unknowns: {TileData} = {}
     for i = 1, #adj do
-        local n: TileData = adj[i]
+        if adj[i].tileType == "unreadable" then return -100, unknowns end
+    end
+    for i = 1, #adj do
+        local n = adj[i]
         if n.tileType == "mine" then
             knownMines = knownMines + 1
-        elseif n.flagged then
-            -- A flag placed and tracked by auto-flag is already a known mine.
-            -- Do not feed it back into the solver as an unknown variable.
-            knownMines = knownMines + 1
-        elseif n.predicted == "mine" then
-            knownMines = knownMines + 1
-        elseif n.predicted == "safe" then
-            -- Skip
         elseif n.tileType == "unknown" then
-            unknownCount = unknownCount + 1
-            unknowns[unknownCount] = n
+            if n.predicted == "mine" then
+                knownMines = knownMines + 1
+            elseif n.predicted ~= "safe" then
+                unknowns[#unknowns + 1] = n
+            end
         end
     end
-    
     return knownMines, unknowns
 end
 
@@ -6770,7 +6854,7 @@ local function RunTrivialPass(): boolean
     for i = 1, TileCount do
         local tile: TileData = Tiles[i]
         
-        if tile.tileType == "number" and tile.number then
+        if (tile.tileType == "number" or tile.tileType == "empty") and tile.number ~= nil then
             local knownMines: number, unknowns: {TileData} = AnalyzeNeighbors(tile)
             local need: number = tile.number - knownMines
             local unknownCount: number = #unknowns
@@ -6806,7 +6890,7 @@ local function RunPairwiseAnalysis(): boolean
     for i = 1, TileCount do
         local tileA: TileData = Tiles[i]
         
-        if tileA.tileType == "number" and tileA.number then
+        if (tileA.tileType == "number" or tileA.tileType == "empty") and tileA.number ~= nil then
             local minesA: number, unknownsA: {TileData} = AnalyzeNeighbors(tileA)
             local needA: number = tileA.number - minesA
             local countA: number = #unknownsA
@@ -6817,7 +6901,7 @@ local function RunPairwiseAnalysis(): boolean
                 for j = 1, #neighborsOfA do
                     local tileB: TileData = neighborsOfA[j]
                     
-                    if tileB.tileType == "number" and tileB.number then
+                    if (tileB.tileType == "number" or tileB.tileType == "empty") and tileB.number ~= nil then
                         local minesB: number, unknownsB: {TileData} = AnalyzeNeighbors(tileB)
                         local needB: number = tileB.number - minesB
                         local countB: number = #unknownsB
@@ -6903,13 +6987,14 @@ local function BuildFrontier(): ()
                     constraints = constraints + 1
                 elseif n.tileType == "empty" then
                     hasRevealed = true
+                    constraints = constraints + 1
                 end
             end
             
             t.hasRevealedNeighbor = hasRevealed
             t.constraintCount = constraints
             
-            if hasRevealed then
+            if hasRevealed and constraints > 0 then
                 FrontierCount = FrontierCount + 1
                 FrontierTiles[FrontierCount] = t
             end
@@ -7078,7 +7163,8 @@ local function PickBestMove(): (TileData?, number)
     for i = 1, TileCount do
         local t: TileData = Tiles[i]
         
-        if t.tileType == "unknown" and t.predicted ~= "mine" then
+        if t.tileType == "unknown" and t.predicted ~= "mine"
+            and (t.predicted == "safe" or t.probability ~= nil) then
             local r: number = t.probability or FALLBACK_RISK
             if t.predicted == "safe" then r = 0 end
             
@@ -7181,7 +7267,7 @@ local function RunTankSolver(): boolean
     for i = 1, TileCount do
         local tile: TileData = Tiles[i]
         
-        if tile.tileType == "number" and tile.number then
+        if (tile.tileType == "number" or tile.tileType == "empty") and tile.number ~= nil then
             local knownMines: number, unknowns: {TileData} = AnalyzeNeighbors(tile)
             local needed: number = tile.number - knownMines
             local eqVars: {number} = TableCreate(8)
@@ -7229,7 +7315,7 @@ local function RunTankSolver(): boolean
     local clusters: {{vars: {number}, eqs: {Equation}}} = TableCreate(10)
     
     for i = 1, unknownCount do
-        if not visitedVars[i] then
+        if not visitedVars[i] and #varToEqIndex[i] > 0 then
             local clusterVars: {number} = TableCreate(50)
             local clusterEqs: {Equation} = TableCreate(50)
             local queue: {number} = TableCreate(50)
@@ -7360,7 +7446,10 @@ local function RunTankSolver(): boolean
                 end
                 local totalWeightLocal: number = 0
                 local solutionCount: number = 0
-                
+                local searchIncomplete = false
+                local searchNodes = 0
+                local searchStart = OsClock()
+
                 local function EnqueueEq(q: {number}, inQueue: {[number]: boolean}, eqIdx: number): ()
                     if not inQueue[eqIdx] then
                         inQueue[eqIdx] = true
@@ -7465,7 +7554,13 @@ local function RunTankSolver(): boolean
                 end
                 
                 local function Backtrack(trail: {{v: number, val: number}}): ()
-                    if solutionCount >= MAX_BACKTRACK_SOLUTIONS then return end
+                    if searchIncomplete then return end
+                    searchNodes = searchNodes + 1
+                    if solutionCount >= MAX_BACKTRACK_SOLUTIONS
+                        or (searchNodes % 256 == 0 and OsClock() - searchStart > 0.05) then
+                        searchIncomplete = true
+                        return
+                    end
                     
                     local v: number? = PickNextVar()
                     
@@ -7527,17 +7622,19 @@ local function RunTankSolver(): boolean
                 
                 ReturnQueuePair(q, inQueue)
                 
-                if totalWeightLocal > 0 then
+                if totalWeightLocal > 0 and not searchIncomplete then
                     for locIdx = 1, #orderedVars do
                         local globId: number = localToGlobal[locIdx]
                         local tile: TileData = unknownList[globId]
                         
                         local weightedHits: number = 0
+                        local rawHits: number = 0
                         local hitsMap: {[number]: number} = solutionHits[locIdx]
                         
                         for m, count in pairs(hitsMap) do
                             local w: number = WEIGHT_TABLE[m] or 1
                             weightedHits = weightedHits + (count * w)
+                            rawHits = rawHits + count
                         end
                         
                         local prob: number = weightedHits / totalWeightLocal
@@ -7547,10 +7644,10 @@ local function RunTankSolver(): boolean
                         
                         tile.probability = prob
                         
-                        if prob < 1e-9 and tile.predicted ~= "safe" then
+                        if rawHits == 0 and tile.predicted ~= "safe" then
                             tile.predicted = "safe"
                             madeProgress = true
-                        elseif prob > 1 - 1e-9 and tile.predicted ~= "mine" then
+                        elseif rawHits == solutionCount and tile.predicted ~= "mine" then
                             tile.predicted = "mine"
                             madeProgress = true
                         end
@@ -7564,36 +7661,67 @@ local function RunTankSolver(): boolean
 end
 
 local function SolveAll(): ()
+    local clues, unreadable, zeros = 0, 0, 0
     for i = 1, TileCount do
-        local tile: TileData = Tiles[i]
-        if tile.tileType == "unknown" then
-            if tile.flagged then
-                -- Preserve our own confirmed flag across solver refreshes.
-                tile.predicted = "mine"
-                tile.probability = 1
-            else
-                tile.predicted = false
-                tile.probability = nil
+        local tile = Tiles[i]
+        tile.predicted = false
+        tile.probability = nil
+        tile.hasRevealedNeighbor = nil
+        if tile.tileType == "number" or tile.tileType == "empty" then
+            clues = clues + 1
+            if tile.tileType == "empty" then zeros = zeros + 1 end
+        elseif tile.tileType == "unreadable" then
+            unreadable = unreadable + 1
+        end
+    end
+    local function hasContradiction(): boolean
+        for i = 1, TileCount do
+            local t = Tiles[i]
+            if (t.tileType == "number" or t.tileType == "empty") and t.number ~= nil then
+                local mines, unknowns = AnalyzeNeighbors(t)
+                if mines >= 0 and (t.number - mines < 0 or t.number - mines > #unknowns) then
+                    for j = 1, TileCount do
+                        Tiles[j].predicted = false
+                        Tiles[j].probability = nil
+                    end
+                    BestMove, BestMoveRisk = nil, 1
+                    SolverStatus = "Inconsistent clue at " .. t.gx .. "|" .. t.gz .. " | check tile reads/spacing"
+                    return true
+                end
             end
         end
+        return false
     end
-    
-    for _ = 1, 15 do
-        local trivialProgress: boolean = RunTrivialPass()
-        local pairwiseProgress: boolean = RunPairwiseAnalysis()
-        if not trivialProgress and not pairwiseProgress then
-            break
+    if hasContradiction() then return end
+    -- Converge after each set of exact deductions before calculating probabilities.
+    for _ = 1, 30 do
+        for _ = 1, 30 do
+            local trivial = RunTrivialPass()
+            local pairwise = RunPairwiseAnalysis()
+            if not trivial and not pairwise then break end
         end
+        if hasContradiction() then return end
+        if not RunTankSolver() then break end
     end
-    
-    if RunTankSolver() then
-        for _ = 1, 5 do
-            if not RunTrivialPass() then break end
-        end
-    end
-    
+    if hasContradiction() then return end
     BestMove, BestMoveRisk = PickBestMove()
+    local solved, uncertain, unresolved = 0, 0, 0
+    for i = 1, TileCount do
+        local t = Tiles[i]
+        if t.tileType == "unknown" then
+            if t.predicted then solved = solved + 1
+            elseif t.probability ~= nil then uncertain = uncertain + 1
+            else unresolved = unresolved + 1 end
+        end
+    end
+    SolverStatus = string.format("Tiles %d | numbers %d | zeros %d | unreadable %d | solved %d | odds %d | ? %d",
+        TileCount, clues - zeros, zeros, unreadable, solved, uncertain, unresolved)
+    if TileCount == 0 then SolverStatus = "Waiting for Flag/Parts board"
+    elseif unreadable > 0 then SolverStatus = SolverStatus .. " | check Text offset/GUI"
+    elseif clues == 0 then SolverStatus = SolverStatus .. " | waiting for revealed clues" end
 end
+
+
 
 ---- autoflag functions ----
 
@@ -7997,50 +8125,50 @@ local function UpdateReferences(): ()
 end
 
 local function ScanForNewTiles(): ()
-    if not MS then return end
-    
-    local success: boolean, children: {Instance}? = SafeGetChildren(MS)
-    if not success or not children then return end
-    
-    local curCount: number = #children
-    
-    if curCount ~= LastChildCount then
-        if LastChildCount < 10 and curCount > 100 then
-            TableClear(Tiles)
-            TableClear(Grid)
-            TileCount = 0
-            RenderCount = 0
-            
+    local board = SafeFindFirstChild(Workspace, FLAG_NAME)
+    local parts = board and SafeFindFirstChild(board, PARTS_NAME)
+    if not parts then
+        local ok, children = SafeGetChildren(Workspace)
+        if ok and children then
             for i = 1, #children do
-                local part: Instance = children[i]
-                if part.ClassName == "Part" or part.ClassName == "MeshPart" then
-                    RegisterTile(part :: BasePart)
-                end
-            end
-            
-            SolverChanged = true
-        else
-            for i = 1, #children do
-                local part: Instance = children[i]
-                local key: string? = PositionToGridKey(part :: BasePart)
-                
-                if key and not Grid[key] then
-                    RegisterTile(part :: BasePart)
-                    SolverChanged = true
-                end
-            end
-            
-            for i = TileCount, 1, -1 do
-                local t: TileData = Tiles[i]
-                if not t.part or not CheckParentValid(t.part) then
-                    UnregisterTile(i)
-                    SolverChanged = true
-                end
+                local candidate = SafeFindFirstChild(children[i], PARTS_NAME)
+                if candidate then board, parts = children[i], candidate; break end
             end
         end
-        
-        LastChildCount = curCount
     end
+    local rebuild = parts ~= MS
+    FLAG, MS = board, parts
+    local ok, children = SafeGetChildren(MS)
+    if not ok or not children then
+        if TileCount > 0 then ResetAllState() end
+        SolverStatus = "Waiting for Flag/Parts board"
+        return
+    end
+    if not rebuild then
+        for i = 1, #children do
+            local part = children[i]
+            if part.ClassName == "Part" or part.ClassName == "MeshPart" then
+                local key = PositionToGridKey(part)
+                if key and (not Grid[key] or Grid[key].part ~= part) then rebuild = true; break end
+            end
+        end
+        if not rebuild then
+            for i = 1, TileCount do
+                if not CheckParentValid(Tiles[i].part) then rebuild = true; break end
+                local parentOK, parent = SafeGetProperty(Tiles[i].part, "Parent")
+                if not parentOK or parent ~= MS then rebuild = true; break end
+            end
+        end
+    end
+    if rebuild or TileCount == 0 then
+        ResetAllState()
+        for i = 1, #children do
+            local part = children[i]
+            if part.ClassName == "Part" or part.ClassName == "MeshPart" then RegisterTile(part) end
+        end
+        SolverChanged = true
+    end
+    LastChildCount = #children
 end
 
 local function ReclassifyTiles(): ()
@@ -8070,35 +8198,19 @@ end
 
 local function PrepareRenderData(): ()
     RenderCount = 0
-    
     for i = 1, TileCount do
-        if RenderCount >= MAX_RENDER_TILES then break end
-        
-        local t: TileData? = Tiles[i]
-        if not t then continue end
-        
-        if t.tileType == "unknown" then
-            if t.predicted == "mine" or t.predicted == "safe" then
+        local t = Tiles[i]
+        if t and t.tileType == "unknown" then
+            local display = t.predicted ~= false or t.probability ~= nil
+            if not display then
+                for _, n in FetchNeighbors(t) do
+                    if n.tileType == "number" or n.tileType == "empty" then display = true; break end
+                end
+            end
+            if display then
+                if RenderCount >= MAX_RENDER_TILES then break end
                 RenderCount = RenderCount + 1
                 RenderData[RenderCount] = t
-            elseif t.probability and t.probability > 0.01 and t.probability < 0.99 then
-                if t.hasRevealedNeighbor == nil then
-                    t.hasRevealedNeighbor = false
-                    local neighbors: {TileData} = FetchNeighbors(t)
-                    
-                    for j = 1, #neighbors do
-                        local n: TileData = neighbors[j]
-                        if n.tileType == "number" or n.tileType == "empty" then
-                            t.hasRevealedNeighbor = true
-                            break
-                        end
-                    end
-                end
-                
-                if t.hasRevealedNeighbor then
-                    RenderCount = RenderCount + 1
-                    RenderData[RenderCount] = t
-                end
             end
         end
     end
@@ -8106,51 +8218,14 @@ end
 
 local function Initialize(): ()
     UpdateReferences()
-    
-    FLAG = SafeFindFirstChild(Workspace, FLAG_NAME)
-    
-    if FLAG then
-        MS = SafeFindFirstChild(FLAG, PARTS_NAME)
-    else
-        local wsSuccess: boolean, wsChildren: {Instance}? = SafeGetChildren(Workspace)
-        if wsSuccess and wsChildren then
-            for i = 1, #wsChildren do
-                local child: Instance = wsChildren[i]
-                local partsFolder: Instance? = SafeFindFirstChild(child, PARTS_NAME)
-                if partsFolder then
-                    FLAG = child
-                    MS = partsFolder
-                    break
-                end
-            end
-        end
-    end
-    
-    if MS then
-        local success: boolean, children: {Instance}? = SafeGetChildren(MS)
-        
-        if success and children then
-            LastChildCount = #children
-            
-            for i = 1, #children do
-                local part: Instance = children[i]
-                RegisterTile(part :: BasePart)
-            end
-        end
-    end
-
-    local detectedNumbers: number = 0
-    for i = 1, TileCount do
-        if Tiles[i].tileType == "number" then
-            detectedNumbers = detectedNumbers + 1
-        end
-    end
-    print("[Minesweeper] Tiles:", TileCount, "Numbers:", detectedNumbers,
-        "TextOffset:", _G.MS_TEXT_OFFSET)
-    
+    ScanForNewTiles()
+    ProbeTextOffset()
+    ReclassifyTiles()
     SolverChanged = true
     SolveAll()
+    SolverChanged = false
     PrepareRenderData()
+    print("[Minesweeper] " .. SolverStatus .. " | TextOffset " .. tostring(_G.MS_TEXT_OFFSET))
 end
 
 local LastCameraUpdateTime: number = 0
@@ -8207,28 +8282,33 @@ end
 local function SafeDrawText(position: vector, size: number, color: Color3, transparency: number, text: string, centered: boolean): ()
     if not position or not color or not text then return end
     
-    Pcall(function()
+    SafeCall("Drawing", function()
         DrawingImmediate.OutlinedText(position, size, color, transparency, text, centered, nil)
     end)
 end
 
+local LastTextProbeTime = OsClock()
 local function SafePostModel(): ()
     if not _G.MS_RUN then return end
     
     TickCount = TickCount + 1
     
     if (TickCount % SCAN_TICKS) == 0 then
-        Pcall(ScanForNewTiles)
+        SafeCall("Board scan", ScanForNewTiles)
     end
     
-    Pcall(ReclassifyTiles)
+    if not _G.MS_TEXT_VALIDATED and TileCount > 0 and OsClock() - LastTextProbeTime >= 10 then
+        LastTextProbeTime = OsClock()
+        SafeCall("Text probe", ProbeTextOffset)
+        SolverChanged = true
+    end
+    SafeCall("Tile reading", ReclassifyTiles)
     
     if SolverChanged then
-        Pcall(SolveAll)
-        SolverChanged = false
+        if SafeCall("Solver", SolveAll) then SolverChanged = false end
     end
     
-    Pcall(PrepareRenderData)
+    SafeCall("Render preparation", PrepareRenderData)
     Pcall(PerformMemoryCleanup)
     Pcall(ValidateStaleTiles)
     Pcall(PerformDeepCleanup)
@@ -8333,9 +8413,11 @@ local function SafeRender(): ()
     local walkColor: Color3 = _G.MS_AUTOWALK and COLOR_WALK_ON or COLOR_STATUS_OFF
     local walkText: string = _G.MS_AUTOWALK and "WALK: ON (C)" or "WALK: OFF (C)"
     
-    SafeDrawText(VectorCreate(12, 785, 0), 16, flagColor, 1, flagText, false)
-    SafeDrawText(VectorCreate(12, 805, 0), 16, walkColor, 1, walkText, false)
+    SafeDrawText(VectorCreate(12, 40, 0), 16, flagColor, 1, flagText, false)
+    SafeDrawText(VectorCreate(12, 60, 0), 16, walkColor, 1, walkText, false)
     
+    SafeDrawText(VectorCreate(12, 20, 0), 14, COLOR_BEST, 1, SolverStatus, false)
+
     if BestMove and BestMove.storedPos then
         local cachedPos: vector? = CachedScreenPositions[BestMove]
         if not cachedPos then
@@ -8374,7 +8456,7 @@ local function SafeRender(): ()
             SafeDrawText(screenVec, 22, COLOR_SAFE, 1, "S", true)
         else
             local prob: number? = t.probability
-            if prob and prob > 0 and prob < 1 then
+            if prob ~= nil and prob >= 0 and prob <= 1 then
                 local pct: number = MathFloor(prob * 100 + 0.5)
                 if pct <= 0 then pct = 1 end
                 if pct >= 100 then pct = 99 end
@@ -8385,6 +8467,8 @@ local function SafeRender(): ()
                 if probColor and probText then
                     SafeDrawText(screenVec, 22, probColor, 1, probText, true)
                 end
+            else
+                SafeDrawText(screenVec, 18, COLOR_STATUS_OFF, 1, "?", true)
             end
         end
     end
@@ -8392,16 +8476,16 @@ local function SafeRender(): ()
     CleanupRenderMemory()
 end
 
-Pcall(Initialize)
+SafeCall("Initialization", Initialize)
 
 RunService.PostModel:Connect(function(): ()
-    Pcall(SafePostModel)
+    SafeCall("Model update", SafePostModel)
 end)
 
 RunService.PostLocal:Connect(function(): ()
-    Pcall(SafePostLocal)
+    SafeCall("Local update", SafePostLocal)
 end)
 
 RunService.Render:Connect(function(): ()
-    Pcall(SafeRender)
+    SafeCall("Render", SafeRender)
 end)
