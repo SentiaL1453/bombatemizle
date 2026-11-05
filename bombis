@@ -155,7 +155,7 @@ local PathGScore: {[string]: number} = {}
 local PathFScore: {[string]: number} = {}
 local PathClosedSet: {[string]: boolean} = {}
 
-local MAX_TILES: number = 1000
+local MAX_TILES: number = 10000
 local MAX_RENDER_TILES: number = MAX_TILES
 local MAX_FRONTIER_TILES: number = MAX_TILES
 local MAX_PENDING_VERIFICATIONS: number = 30
@@ -353,6 +353,8 @@ local TickCount: number = 0
 local LastChildCount: number = 0
 local SolverChanged: boolean = false
 local SolverStatus: string = "Starting"
+local BoardPartCount = 0
+local IncompleteClueCount = 0
 local LastReportedError: {[string]: number} = {}
 local function SafeCall(stage: string, callback: () -> ()): boolean
     local ok, err = Pcall(callback)
@@ -1094,7 +1096,15 @@ local function RegisterTile(part: BasePart): ()
     if not key or not gx or not gz then return end
     
     if Grid[key] then
-        if Grid[key].part == part then return end
+        -- One board coordinate must correspond to one solver variable.
+        if Grid[key].part ~= part then
+            local now = OsClock()
+            if not LastReportedError["Grid collision"] or now - LastReportedError["Grid collision"] >= 5 then
+                LastReportedError["Grid collision"] = now
+                print("[BoardDebug] Multiple board parts map to " .. key .. "; check tile spacing/parts folder")
+            end
+        end
+        return
     end
     
     local tileType: string, val: number? = DetermineTileType(part)
@@ -1920,14 +1930,17 @@ local function ReduceEquations(localEqs: {Equation}): ({Equation}?, string)
 end
 
 local function AnalyzeNeighbors(t: TileData): (number, {TileData})
-    local adj = FetchNeighbors(t)
     local knownMines = 0
     local unknowns: {TileData} = {}
-    for i = 1, #adj do
-        if adj[i].tileType == "unreadable" then return -100, unknowns end
-    end
-    for i = 1, #adj do
-        local n = adj[i]
+    -- Missing/streamed-out tiles are unknown information, not revealed safe cells.
+    -- A true outer-edge clue is also deferred until its board boundary is known.
+    for i = 1, 8 do
+        local offset = NEIGHBOR_OFFSETS[i]
+        local n = Grid[(t.gx + offset[1]) .. "|" .. (t.gz + offset[2])]
+        if not n or (n.tileType ~= "mine" and n.tileType ~= "unknown"
+            and n.tileType ~= "number" and n.tileType ~= "empty") then
+            return -100, {}
+        end
         if n.tileType == "mine" then
             knownMines = knownMines + 1
         elseif n.tileType == "unknown" then
@@ -2778,7 +2791,19 @@ local function SolveAll(): ()
                         Tiles[j].probability = nil
                     end
                     BestMove, BestMoveRisk = nil, 1
-                    SolverStatus = "Inconsistent clue at " .. t.gx .. "|" .. t.gz .. " | check tile reads/spacing"
+                    SolverStatus = string.format("Clue conflict %d|%d: value=%d mines=%d unknown=%d | tiles %d/%d",
+                        t.gx, t.gz, t.number, mines, #unknowns, TileCount, BoardPartCount)
+                    local now = OsClock()
+                    if not LastReportedError["Clue conflict"] or now - LastReportedError["Clue conflict"] >= 5 then
+                        LastReportedError["Clue conflict"] = now
+                        local states = {}
+                        for _, offset in NEIGHBOR_OFFSETS do
+                            local key = (t.gx + offset[1]) .. "|" .. (t.gz + offset[2])
+                            local n = Grid[key]
+                            states[#states + 1] = key .. "=" .. (n and (n.tileType .. ":" .. tostring(n.number)) or "missing")
+                        end
+                        print("[BoardDebug] " .. SolverStatus .. " | " .. TableConcat(states, ", "))
+                    end
                     return true
                 end
             end
@@ -2799,6 +2824,14 @@ local function SolveAll(): ()
     if hasContradiction() then return end
     BestMove, BestMoveRisk = PickBestMove()
     local solved, uncertain, unresolved = 0, 0, 0
+    IncompleteClueCount = 0
+    for i = 1, TileCount do
+        local t = Tiles[i]
+        if t.tileType == "number" or t.tileType == "empty" then
+            local mines = AnalyzeNeighbors(t)
+            if mines < 0 then IncompleteClueCount = IncompleteClueCount + 1 end
+        end
+    end
     for i = 1, TileCount do
         local t = Tiles[i]
         if t.tileType == "unknown" then
@@ -2809,6 +2842,12 @@ local function SolveAll(): ()
     end
     SolverStatus = string.format("Tiles %d | numbers %d | zeros %d | unreadable %d | solved %d | odds %d | ? %d",
         TileCount, clues - zeros, zeros, unreadable, solved, uncertain, unresolved)
+    if IncompleteClueCount > 0 then
+        SolverStatus = SolverStatus .. " | incomplete/edge clues " .. IncompleteClueCount
+    end
+    if BoardPartCount > MAX_TILES then
+        SolverStatus = SolverStatus .. " | board exceeds tile limit"
+    end
     if TileCount == 0 then SolverStatus = "Waiting for Flag/Parts board"
     elseif unreadable > 0 then SolverStatus = SolverStatus .. " | check Text offset/GUI"
     elseif clues == 0 then SolverStatus = SolverStatus .. " | waiting for revealed clues" end
@@ -3236,6 +3275,12 @@ local function ScanForNewTiles(): ()
         if TileCount > 0 then ResetAllState() end
         SolverStatus = "Waiting for Flag/Parts board"
         return
+    end
+    BoardPartCount = 0
+    for i = 1, #children do
+        if children[i].ClassName == "Part" or children[i].ClassName == "MeshPart" then
+            BoardPartCount = BoardPartCount + 1
+        end
     end
     if not rebuild then
         for i = 1, #children do
